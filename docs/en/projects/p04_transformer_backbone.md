@@ -58,7 +58,27 @@ def _resolve_device():
 DEVICE = _resolve_device()
 USE_TPU = DEVICE.type == 'xla'
 USE_CUDA = DEVICE.type == 'cuda'
+IS_ROCM = USE_CUDA and torch.version.hip is not None
 LOAD_DEVICE = torch.device('cpu') if USE_TPU else DEVICE
+
+
+def _is_rocm_radeon():
+    if not IS_ROCM:
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(':')[0]
+    except Exception:
+        return False
+    return arch.startswith(('gfx10', 'gfx11', 'gfx12'))
+
+
+# Fall back to the math SDPA backend only on Radeon.
+IS_ROCM_RADEON = _is_rocm_radeon()
+if IS_ROCM_RADEON:
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+    print('ROCm Radeon (RDNA) detected: using math SDPA backend to avoid NaN.')
 
 
 def optimizer_step(optimizer, scaler=None):
@@ -486,8 +506,13 @@ for epoch in range(TRANS_EPOCHS):
         loss = tok_loss + 0.5 * rew_loss + 0.1 * done_loss
         opt_t.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(transformer_wm.parameters(), 1.0)
-        opt_t.step()
+        # On ROCm Radeon (RDNA), skip non-finite gradients so they cannot corrupt the weights
+        grads_finite = (not IS_ROCM_RADEON) or all(
+            p.grad is None or torch.isfinite(p.grad).all()
+            for p in transformer_wm.parameters())
+        if grads_finite:
+            nn.utils.clip_grad_norm_(transformer_wm.parameters(), 1.0)
+            opt_t.step()
 
         ep_tok += tok_loss.item()
         ep_rew += rew_loss.item()
