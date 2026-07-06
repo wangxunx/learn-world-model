@@ -60,6 +60,21 @@ USE_TPU = DEVICE.type == 'xla'
 USE_CUDA = DEVICE.type == 'cuda'
 LOAD_DEVICE = torch.device('cpu') if USE_TPU else DEVICE
 
+IS_ROCM = USE_CUDA and torch.version.hip is not None
+
+
+def _is_rocm_radeon():
+    if not IS_ROCM:
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(':')[0]
+    except Exception:
+        return False
+    return arch.startswith(('gfx10', 'gfx11', 'gfx12'))
+
+
+IS_ROCM_RADEON = _is_rocm_radeon()
+
 
 def optimizer_step(optimizer, scaler=None):
     if USE_TPU:
@@ -298,6 +313,31 @@ SEQ_LEN = 20   # trajectory length
 N_ACTIONS = 2
 
 
+# On ROCm Radeon (RDNA) the fused native_layer_norm_backward kernel can emit
+# non-finite gradients; a primitive decomposition avoids that kernel.
+class DecomposedLayerNorm(nn.Module):
+    def __init__(self, ref):
+        super().__init__()
+        self.normalized_shape = tuple(ref.normalized_shape)
+        self.eps = ref.eps
+        self.weight = nn.Parameter(ref.weight.detach().clone())
+        self.bias = nn.Parameter(ref.bias.detach().clone())
+
+    def forward(self, x):
+        dims = tuple(range(x.dim() - len(self.normalized_shape), x.dim()))
+        mean = x.mean(dim=dims, keepdim=True)
+        var = x.var(dim=dims, unbiased=False, keepdim=True)
+        return (x - mean) / torch.sqrt(var + self.eps) * self.weight + self.bias
+
+
+def _decompose_layernorms(module):
+    for name, child in module.named_children():
+        if isinstance(child, nn.LayerNorm):
+            setattr(module, name, DecomposedLayerNorm(child))
+        else:
+            _decompose_layernorms(child)
+
+
 class CausalTransformerWM(nn.Module):
     def __init__(self, num_categories=NUM_CATEGORIES, d_model=D_MODEL,
                  n_heads=N_HEADS, n_layers=N_LAYERS, n_actions=N_ACTIONS,
@@ -370,6 +410,10 @@ class CausalTransformerWM(nn.Module):
 
 
 transformer_wm = CausalTransformerWM().to(DEVICE)
+if IS_ROCM_RADEON:
+    _decompose_layernorms(transformer_wm)
+    transformer_wm = transformer_wm.to(DEVICE)
+    print('ROCm Radeon (RDNA) detected: using decomposed LayerNorm to avoid a fused-kernel NaN.')
 total_params_t = sum(p.numel() for p in transformer_wm.parameters())
 print(f'Causal Transformer parameters: {total_params_t:,}')
 ```

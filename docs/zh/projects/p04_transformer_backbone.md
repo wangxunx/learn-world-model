@@ -109,6 +109,21 @@ USE_TPU = DEVICE.type == 'xla'
 USE_CUDA = DEVICE.type == 'cuda'
 LOAD_DEVICE = torch.device('cpu') if USE_TPU else DEVICE
 
+IS_ROCM = USE_CUDA and torch.version.hip is not None
+
+
+def _is_rocm_radeon():
+    if not IS_ROCM:
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(':')[0]
+    except Exception:
+        return False
+    return arch.startswith(('gfx10', 'gfx11', 'gfx12'))
+
+
+IS_ROCM_RADEON = _is_rocm_radeon()
+
 
 def optimizer_step(optimizer, scaler=None):
     if USE_TPU:
@@ -347,6 +362,31 @@ SEQ_LEN = 20   # 轨迹长度
 N_ACTIONS = 2
 
 
+# 在 ROCm Radeon (RDNA) 上，融合的 native_layer_norm_backward 内核会产生非有限梯度；
+# 用基本算子分解 LayerNorm 可绕开该内核。
+class DecomposedLayerNorm(nn.Module):
+    def __init__(self, ref):
+        super().__init__()
+        self.normalized_shape = tuple(ref.normalized_shape)
+        self.eps = ref.eps
+        self.weight = nn.Parameter(ref.weight.detach().clone())
+        self.bias = nn.Parameter(ref.bias.detach().clone())
+
+    def forward(self, x):
+        dims = tuple(range(x.dim() - len(self.normalized_shape), x.dim()))
+        mean = x.mean(dim=dims, keepdim=True)
+        var = x.var(dim=dims, unbiased=False, keepdim=True)
+        return (x - mean) / torch.sqrt(var + self.eps) * self.weight + self.bias
+
+
+def _decompose_layernorms(module):
+    for name, child in module.named_children():
+        if isinstance(child, nn.LayerNorm):
+            setattr(module, name, DecomposedLayerNorm(child))
+        else:
+            _decompose_layernorms(child)
+
+
 class CausalTransformerWM(nn.Module):
     def __init__(self, num_categories=NUM_CATEGORIES, d_model=D_MODEL,
                  n_heads=N_HEADS, n_layers=N_LAYERS, n_actions=N_ACTIONS,
@@ -419,6 +459,10 @@ class CausalTransformerWM(nn.Module):
 
 
 transformer_wm = CausalTransformerWM().to(DEVICE)
+if IS_ROCM_RADEON:
+    _decompose_layernorms(transformer_wm)
+    transformer_wm = transformer_wm.to(DEVICE)
+    print('检测到 ROCm Radeon (RDNA)：改用分解式 LayerNorm 以避免融合内核 NaN。')
 total_params_t = sum(p.numel() for p in transformer_wm.parameters())
 print(f'因果 Transformer 参数量：{total_params_t:,}')
 ```
